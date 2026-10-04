@@ -2,6 +2,7 @@
 
 [![CI Tests](https://github.com/Yannis-A-D/encrypted_sqlite_system/actions/workflows/tests.yml/badge.svg)](https://github.com/Yannis-A-D/encrypted_sqlite_system/actions/workflows/tests.yml)
 [![PyPI Version](https://img.shields.io/pypi/v/encrypted-sqlite-system.svg)](https://pypi.org/project/encrypted-sqlite-system/)
+[![Docs](https://img.shields.io/badge/docs-mkdocs-blue.svg?logo=materialformkdocs)](https://yannis-a-d.github.io/encrypted_sqlite_system/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Encryption](https://img.shields.io/badge/encryption-AES--256--GCM-brightgreen.svg)](https://cryptography.io/)
 [![Database](https://img.shields.io/badge/storage-SQLite%20WAL-orange.svg)](https://sqlite.org/)

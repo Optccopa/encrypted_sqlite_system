@@ -41,7 +41,9 @@ jobs:
         twine check dist/*
 
     - name: Publish package to PyPI
+      # Uses PyPI Trusted Publishing (OIDC) - no API token secret required.
+      # Configure once at https://pypi.org/manage/account/publishing/ :
+      #   owner: Yannis-A-D, repo: encrypted_sqlite_system, workflow: publish.yml
       uses: pypa/gh-action-pypi-publish@release/v1
       with:
-        password: ${{ secrets.PYPI_API_TOKEN }}
         skip-existing: true
