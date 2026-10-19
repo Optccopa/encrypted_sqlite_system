@@ -24,6 +24,36 @@ from pathlib import Path
 from .database import DB_PATH, DATA_DIR
 
 
+def encrypt_snapshot_file(source_path: Path, output_path: Path, raw_key: bytes | None = None) -> Path:
+    """Encrypt a point-in-time SQLite snapshot file using AES-256-GCM envelope encryption."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from .database import _get_raw_key_material
+    key = raw_key if raw_key is not None else _get_raw_key_material()
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    data = source_path.read_bytes()
+    ciphertext = aesgcm.encrypt(nonce, data, associated_data=b"sqlite-snapshot-envelope-v1")
+    payload = b"ENCSNAP1:" + nonce + ciphertext
+    output_path.write_bytes(payload)
+    return output_path
+
+
+def decrypt_snapshot_file(source_path: Path, output_path: Path, raw_key: bytes | None = None) -> Path:
+    """Decrypt an encrypted snapshot envelope file using AES-256-GCM."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from .database import _get_raw_key_material
+    key = raw_key if raw_key is not None else _get_raw_key_material()
+    aesgcm = AESGCM(key)
+    raw = source_path.read_bytes()
+    if not raw.startswith(b"ENCSNAP1:") or len(raw) < 21:
+        raise ValueError("Invalid encrypted snapshot format or missing header.")
+    nonce = raw[9:21]
+    ciphertext = raw[21:]
+    plaintext = aesgcm.decrypt(nonce, ciphertext, associated_data=b"sqlite-snapshot-envelope-v1")
+    output_path.write_bytes(plaintext)
+    return output_path
+
+
 class CloudSyncEngine:
     """Manages online encrypted database snapshots and S3 cloud synchronization."""
 
@@ -81,42 +111,61 @@ class CloudSyncEngine:
         self,
         snapshot_path: Path | None = None,
         retention_count: int = 7,
-        client: Any = None
+        client: Any = None,
+        encrypt: bool = False
     ) -> dict:
         """
         Upload local encrypted database snapshot to S3/Cloudflare R2 and prune older backups.
+        Supports whole-file AES-256-GCM envelope encryption.
         """
         if snapshot_path is None or not snapshot_path.exists():
             snapshot_path = self.create_local_snapshot()
 
-        file_size = snapshot_path.stat().st_size
-        checksum = self.compute_file_sha256(snapshot_path)
-        remote_key = f"backups/{snapshot_path.name}"
+        should_encrypt = encrypt or os.getenv("ENCRYPT_CLOUD_BACKUPS", "false").lower() in ("true", "1", "yes")
+        upload_path = snapshot_path
+        temp_enc_path = None
 
-        s3_client = client or self._get_s3_client()
+        if should_encrypt and not snapshot_path.name.endswith(".enc"):
+            temp_enc_path = snapshot_path.with_suffix(snapshot_path.suffix + ".enc")
+            encrypt_snapshot_file(snapshot_path, temp_enc_path)
+            upload_path = temp_enc_path
 
-        if s3_client is not None:
-            # Upload snapshot to S3 bucket
-            with open(snapshot_path, "rb") as f:
-                s3_client.put_object(
-                    Bucket=self.bucket_name,
-                    Key=remote_key,
-                    Body=f,
-                    Metadata={"sha256": checksum}
-                )
+        try:
+            file_size = upload_path.stat().st_size
+            checksum = self.compute_file_sha256(upload_path)
+            remote_key = f"backups/{upload_path.name}"
 
-            # Auto-prune old remote backups if retention_count is set
-            self._prune_remote_backups(s3_client, retention_count)
+            s3_client = client or self._get_s3_client()
 
-        return {
-            "status": "success",
-            "snapshot_file": str(snapshot_path.name),
-            "size_bytes": file_size,
-            "sha256": checksum,
-            "remote_key": remote_key,
-            "bucket": self.bucket_name,
-            "timestamp": int(time.time()),
-        }
+            if s3_client is not None:
+                # Upload snapshot to S3 bucket
+                with open(upload_path, "rb") as f:
+                    s3_client.put_object(
+                        Bucket=self.bucket_name,
+                        Key=remote_key,
+                        Body=f,
+                        Metadata={"sha256": checksum, "encrypted": str(should_encrypt).lower()}
+                    )
+
+                # Auto-prune old remote backups if retention_count is set
+                self._prune_remote_backups(s3_client, retention_count)
+
+            return {
+                "status": "success",
+                "snapshot_file": str(upload_path.name),
+                "size_bytes": file_size,
+                "sha256": checksum,
+                "remote_key": remote_key,
+                "bucket": self.bucket_name,
+                "encrypted": should_encrypt,
+                "timestamp": int(time.time()),
+            }
+        finally:
+            if temp_enc_path is not None and temp_enc_path.exists():
+                try:
+                    temp_enc_path.unlink()
+                except Exception:
+                    pass
 
     def list_cloud_backups(self, client: Any = None) -> list[dict]:
         """List all available remote backups in the cloud bucket."""
@@ -145,16 +194,30 @@ class CloudSyncEngine:
         target_path: Path | None = None,
         client: Any = None
     ) -> bool:
-        """Download remote backup and restore database."""
+        """Download remote backup, decrypt if envelope-encrypted, and restore database."""
         target_path = target_path or DB_PATH
         s3_client = client or self._get_s3_client()
         if s3_client is None:
             return False
 
         temp_restore = DATA_DIR / "restore_temp.db"
+        temp_download = DATA_DIR / "restore_download.tmp"
         try:
-            with open(temp_restore, "wb") as f:
+            with open(temp_download, "wb") as f:
                 s3_client.download_fileobj(self.bucket_name, remote_key, f)
+
+            # Check if downloaded backup is envelope-encrypted
+            is_encrypted = False
+            with open(temp_download, "rb") as f:
+                header = f.read(9)
+                if header == b"ENCSNAP1:":
+                    is_encrypted = True
+
+            if is_encrypted or remote_key.endswith(".enc"):
+                decrypt_snapshot_file(temp_download, temp_restore)
+                temp_download.unlink(missing_ok=True)
+            else:
+                shutil.move(temp_download, temp_restore)
 
             # Verify SQLite integrity
             check_conn = sqlite3.connect(str(temp_restore))
@@ -169,6 +232,8 @@ class CloudSyncEngine:
             return True
         except Exception as e:
             print(f"[CloudSync] Error restoring cloud backup: {e}")
+            if temp_download.exists():
+                temp_download.unlink()
             if temp_restore.exists():
                 temp_restore.unlink()
             return False

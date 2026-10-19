@@ -43,6 +43,11 @@ class BloomFilter:
             indexes.append(combined_hash)
         return indexes
 
+    def clear(self):
+        """Reset the bloom filter bit array to zero elements."""
+        self._bit_array = bytearray((self.size + 7) // 8)
+        self._count = 0
+
     def add(self, key: str):
         """Add a key to the bloom filter."""
         for bit_idx in self._get_hashes(key):

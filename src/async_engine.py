@@ -25,14 +25,23 @@ async def async_load_json(file_or_key: str | Path, default: Any = _DEFAULT_UNSET
     key = Path(file_or_key).name if isinstance(file_or_key, (str, Path)) else str(file_or_key)
     now = time.time()
 
-    # Fast L1 check
+    # Fast L1 check via adapter
     with _lock:
-        if key in cache._l1_store:
-            val, exp = cache._l1_store[key]
-            if exp == 0 or exp > now:
-                cache._l1_store.move_to_end(key)
-                cache._hits += 1
-                return val
+        val, hit = cache._adapter.get(key)
+        if hit:
+            cache._hits += 1
+            try:
+                from .metrics import metrics
+                metrics.record_cache_hit()
+            except Exception:
+                pass
+            return val
+        cache._misses += 1
+        try:
+            from .metrics import metrics
+            metrics.record_cache_miss()
+        except Exception:
+            pass
 
     # L1 Miss: Offload L2 SQLite read & AES decryption to worker thread
     return await asyncio.to_thread(load_json, file_or_key, default)

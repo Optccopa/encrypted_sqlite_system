@@ -41,10 +41,10 @@ class WriteBehindEngine:
         # Register auto-flush on application exit
         atexit.register(self.flush)
 
-    def queue_write(self, key: str, data: Any):
-        """Enqueue a document write (coalesces duplicate writes to the same key)."""
+    def queue_write(self, key: str, data: Any, ttl: float | None = None):
+        """Enqueue a document write with optional TTL (coalesces duplicate writes to the same key)."""
         with self._lock:
-            self._queue[key] = data
+            self._queue[key] = (data, ttl)
             needs_immediate_flush = len(self._queue) >= self.max_batch_size
 
         if needs_immediate_flush:
@@ -61,16 +61,28 @@ class WriteBehindEngine:
         if not items:
             return
 
-        from .database import get_db_connection, pack_and_encrypt
+        from .database import (
+            get_db_connection,
+            pack_and_encrypt,
+            _update_blind_indexes,
+            bloom,
+        )
         conn = get_db_connection()
         now_ts = int(time.time())
 
         # Prepare encrypted batch
         batch_records = []
-        for key, val in items:
+        raw_items = []
+        for key, entry in items:
+            if isinstance(entry, tuple) and len(entry) == 2:
+                val, ttl = entry
+            else:
+                val, ttl = entry, None
             try:
                 encrypted_blob = pack_and_encrypt(val)
-                batch_records.append((key, encrypted_blob, now_ts))
+                expires_at = int(now_ts + ttl) if (ttl is not None and ttl > 0) else 0
+                batch_records.append((key, encrypted_blob, expires_at, now_ts))
+                raw_items.append((key, val))
             except Exception as e:
                 print(f"[WriteBehind] Error encrypting key '{key}': {e}")
 
@@ -78,19 +90,37 @@ class WriteBehindEngine:
         if batch_records:
             with conn:
                 conn.executemany("""
-                    INSERT INTO kv_store (key, value, updated_at)
-                    VALUES (?, ?, ?)
+                    INSERT INTO kv_store (key, value, version, expires_at, updated_at)
+                    VALUES (?, ?, 1, ?, ?)
                     ON CONFLICT(key) DO UPDATE SET
                         value = excluded.value,
+                        version = version + 1,
+                        expires_at = excluded.expires_at,
                         updated_at = excluded.updated_at;
                 """, batch_records)
 
-            from .database import bloom
-            for key, _, _ in batch_records:
+                # Update blind indexes for all flushed items
+                for key, val in raw_items:
+                    _update_blind_indexes(conn, key, val)
+
+            for key, _, _, _ in batch_records:
                 bloom.add(key)
 
             self._flushes_count += 1
             self._items_flushed_count += len(batch_records)
+
+            try:
+                from .metrics import metrics
+                metrics.record_operation("write", count=len(batch_records))
+            except Exception:
+                pass
+
+            try:
+                from .events import events
+                for key, val in raw_items:
+                    events.emit("write", key=key, value=val)
+            except Exception:
+                pass
 
     def _worker_loop(self):
         """Background loop flushing batches periodically."""

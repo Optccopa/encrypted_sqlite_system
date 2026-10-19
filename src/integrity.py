@@ -11,16 +11,18 @@ Mathematically verifies that stored encrypted records have not suffered from:
 import hmac
 import hashlib
 from typing import Any
-from .database import get_db_connection, decrypt_and_unpack, _get_cipher
+from .database import get_db_connection, decrypt_and_unpack, _get_cipher, _get_integrity_key
 from cryptography.fernet import InvalidToken
 
 
 def compute_record_checksum(key: str, val_bytes: bytes, updated_at: int, secret_key: bytes | None = None) -> str:
     """Compute an HMAC-SHA256 signature for a database record."""
     if secret_key is None:
-        cipher = _get_cipher()
-        # Derive signing key from fernet key
-        secret_key = cipher._signing_key if hasattr(cipher, "_signing_key") else b"default_secret_seed"
+        try:
+            secret_key = _get_integrity_key()
+        except Exception:
+            cipher = _get_cipher()
+            secret_key = cipher._signing_key if hasattr(cipher, "_signing_key") else b"default_secret_seed"
 
     h = hmac.new(secret_key, digestmod=hashlib.sha256)
     h.update(key.encode("utf-8"))

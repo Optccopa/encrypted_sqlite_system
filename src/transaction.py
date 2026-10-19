@@ -18,6 +18,7 @@ class Transaction:
         self._cache = cache_instance or default_cache
         self._staged_writes: dict[str, tuple[Any, float | None]] = {}
         self._staged_deletes: set[str] = set()
+        self._read_versions: dict[str, int] = {}
         self._active: bool = True
         self._committed: bool = False
         self._rolled_back: bool = False
@@ -53,7 +54,12 @@ class Transaction:
             return default
         if key in self._staged_writes:
             return self._staged_writes[key][0]
-        return self._cache.get(key, default=default)
+
+        from .database import kv_get_versioned
+        val, ver = kv_get_versioned(key, default=default)
+        if key not in self._read_versions and ver > 0:
+            self._read_versions[key] = ver
+        return val
 
     def commit(self):
         """Atomically commit all staged writes and deletes to SQLite and L1 cache."""
@@ -70,7 +76,8 @@ class Transaction:
             pack_and_encrypt,
             _update_blind_indexes,
             bloom,
-            init_db
+            init_db,
+            ConcurrentModificationError
         )
         from .metrics import metrics
         from .events import events
@@ -78,6 +85,19 @@ class Transaction:
         init_db()
         conn = get_db_connection()
         now_ts = int(time.time())
+
+        # Optimistic concurrency verification for keys read during this transaction
+        if self._read_versions:
+            for r_key, expected_ver in self._read_versions.items():
+                if r_key in self._staged_writes or r_key in self._staged_deletes:
+                    cur = conn.execute("SELECT version FROM kv_store WHERE key = ?", (r_key,))
+                    row = cur.fetchone()
+                    current_ver = row["version"] if row else 0
+                    if current_ver != expected_ver:
+                        self.rollback()
+                        raise ConcurrentModificationError(
+                            f"Optimistic lock conflict on key '{r_key}': version was {expected_ver} at read time, but is now {current_ver}."
+                        )
 
         # Prepare batch writes
         batch_records = []

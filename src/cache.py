@@ -128,7 +128,7 @@ class TwoTierCache:
         self.set_l1_only(key, data, effective_l1_ttl)
 
         if self._write_behind_engine is not None:
-            self._write_behind_engine.queue_write(key, data)
+            self._write_behind_engine.queue_write(key, data, ttl=db_ttl)
         else:
             from .database import kv_set
             try:

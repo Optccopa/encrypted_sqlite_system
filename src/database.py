@@ -20,7 +20,10 @@ from pathlib import Path
 from typing import Any
 import hashlib
 import hmac
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.exceptions import InvalidTag
 
@@ -69,15 +72,59 @@ DB_PATH = DATA_DIR / "app_database.db"
 # Encryption Key setup and prefixes
 _cipher_aesgcm: AESGCM | None = None
 _cipher_fernet: Fernet | None = None
+_cipher_chacha: ChaCha20Poly1305 | None = None
 
 _PREFIX_GCM = b"G256:"
 _PREFIX_FERNET = b"F128:"
+_PREFIX_CHACHA = b"C256:"
 _MAGIC_COMPRESSED_ZL = b"ZL1:"
 _MAGIC_COMPRESSED_ZSTD = b"ZS1:"
 _MAGIC_COMPRESSED = _MAGIC_COMPRESSED_ZL
 _MAGIC_RAW = b"RW1:"
 
 _compression_override: str | None = None
+SALT_FILE = DATA_DIR / ".db.salt"
+
+
+def get_or_create_db_salt() -> bytes:
+    """Retrieve or generate a 16-byte cryptographically secure salt for PBKDF2 passphrase derivation."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if SALT_FILE.exists():
+        try:
+            salt = SALT_FILE.read_bytes()
+            if len(salt) >= 16:
+                return salt[:16]
+        except Exception:
+            pass
+    salt = os.urandom(16)
+    try:
+        SALT_FILE.write_bytes(salt)
+    except Exception:
+        pass
+    return salt
+
+
+def derive_key_from_passphrase(passphrase: str, salt: bytes | None = None) -> tuple[bytes, bytes]:
+    """
+    Derive a 256-bit encryption key from a human passphrase using PBKDF2-HMAC-SHA256 (600,000 rounds).
+    Returns (raw_32_bytes, salt).
+    """
+    if salt is None:
+        salt = get_or_create_db_salt()
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=600_000,
+    )
+    key_material = kdf.derive(passphrase.encode("utf-8"))
+    return key_material, salt
+
+
+def set_cipher_passphrase(passphrase: str, salt: bytes | None = None):
+    """Set active database cipher using a human passphrase."""
+    key_bytes, _ = derive_key_from_passphrase(passphrase, salt=salt)
+    set_cipher_key(key_bytes)
 
 
 def get_active_compression() -> str:
@@ -111,12 +158,8 @@ def get_active_algorithm() -> str:
     return os.getenv("ENCRYPTION_ALGORITHM", "AES-256-GCM").upper()
 
 
-def _get_ciphers() -> tuple[AESGCM, Fernet]:
-    """Retrieve or generate both AESGCM and Fernet cipher instances."""
-    global _cipher_aesgcm, _cipher_fernet
-    if _cipher_aesgcm is not None and _cipher_fernet is not None:
-        return _cipher_aesgcm, _cipher_fernet
-
+def _get_raw_key_material() -> bytes:
+    """Retrieve raw 32 bytes of the active master key."""
     raw_key = os.getenv("ENCRYPTION_KEY")
     if not raw_key:
         key_file = ROOT_DIR / "secret.key"
@@ -133,14 +176,63 @@ def _get_ciphers() -> tuple[AESGCM, Fernet]:
     if isinstance(raw_key, str):
         raw_key = raw_key.encode("utf-8")
 
+    try:
+        decoded = base64.urlsafe_b64decode(raw_key)
+        if len(decoded) == 32:
+            return decoded
+    except Exception:
+        pass
+
+    if len(raw_key) == 32:
+        return raw_key
+
+    return hashlib.sha256(raw_key).digest()
+
+
+def _get_ciphers() -> tuple[AESGCM, Fernet]:
+    """Retrieve or generate both AESGCM and Fernet cipher instances."""
+    global _cipher_aesgcm, _cipher_fernet, _cipher_chacha
+    if _cipher_aesgcm is not None and _cipher_fernet is not None:
+        return _cipher_aesgcm, _cipher_fernet
+
+    raw_key = os.getenv("ENCRYPTION_KEY")
+    if not raw_key:
+        key_file = ROOT_DIR / "secret.key"
+        if key_file.exists():
+            raw_key = key_file.read_text().strip()
+        else:
+            raw_key_bytes = AESGCM.generate_key(bit_length=256)
+            new_key = base64.urlsafe_b64encode(raw_key_bytes).decode("utf-8")
+            key_file.write_text(new_key)
+            raw_key = new_key
+            print(f"[Database] Generated new encryption key and saved to {key_file.name}")
+
+    if isinstance(raw_key, str):
+        raw_key = raw_key.encode("utf-8")
+
+    key_material = _get_raw_key_material()
+
     # Initialize Fernet (expects base64 key)
-    _cipher_fernet = Fernet(raw_key)
+    fernet_b64 = base64.urlsafe_b64encode(key_material)
+    _cipher_fernet = Fernet(fernet_b64)
 
     # Initialize AESGCM (expects raw 32-byte key material)
-    key_material = base64.urlsafe_b64decode(raw_key)
     _cipher_aesgcm = AESGCM(key_material)
 
+    # Initialize ChaCha20Poly1305
+    _cipher_chacha = ChaCha20Poly1305(key_material)
+
     return _cipher_aesgcm, _cipher_fernet
+
+
+def _get_chacha_cipher() -> ChaCha20Poly1305:
+    """Retrieve or initialize ChaCha20Poly1305 cipher."""
+    global _cipher_chacha
+    if _cipher_chacha is not None:
+        return _cipher_chacha
+    key_material = _get_raw_key_material()
+    _cipher_chacha = ChaCha20Poly1305(key_material)
+    return _cipher_chacha
 
 
 def _get_cipher() -> Any:
@@ -149,12 +241,14 @@ def _get_cipher() -> Any:
     algo = get_active_algorithm()
     if algo == "AES-128-FERNET":
         return fernet_cipher
+    elif algo in ("CHACHA20-POLY1305", "CHACHA20", "XCHACHA20-POLY1305"):
+        return _get_chacha_cipher()
     return aesgcm_cipher
 
 
 def set_cipher_key(new_key: str | bytes):
-    """Update active in-memory cipher keys (both AESGCM and Fernet)."""
-    global _cipher_aesgcm, _cipher_fernet
+    """Update active in-memory cipher keys (AESGCM, Fernet, and ChaCha20Poly1305)."""
+    global _cipher_aesgcm, _cipher_fernet, _cipher_chacha
     if isinstance(new_key, str):
         new_key = new_key.encode("utf-8")
     
@@ -164,6 +258,7 @@ def set_cipher_key(new_key: str | bytes):
         if len(key_material) == 32:
             _cipher_aesgcm = AESGCM(key_material)
             _cipher_fernet = Fernet(new_key)
+            _cipher_chacha = ChaCha20Poly1305(key_material)
             os.environ["ENCRYPTION_KEY"] = new_key.decode("utf-8")
             return
     except Exception:
@@ -172,26 +267,58 @@ def set_cipher_key(new_key: str | bytes):
     if len(new_key) == 32:
         _cipher_aesgcm = AESGCM(new_key)
         _cipher_fernet = Fernet(base64.urlsafe_b64encode(new_key))
+        _cipher_chacha = ChaCha20Poly1305(new_key)
         os.environ["ENCRYPTION_KEY"] = base64.urlsafe_b64encode(new_key).decode("utf-8")
     else:
         raise ValueError("Key must be 32 bytes or 44-character URL-safe Base64 encoded key.")
 
 
+def derive_indexing_key(raw_key: bytes) -> bytes:
+    """Derive a secure 32-byte blind indexing key from master key using HKDF domain separation."""
+    try:
+        decoded = base64.urlsafe_b64decode(raw_key)
+        if len(decoded) == 32:
+            raw_key = decoded
+    except Exception:
+        pass
+    if len(raw_key) != 32:
+        raw_key = hashlib.sha256(raw_key).digest()
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"sqlite-blind-index-salt-v1",
+        info=b"sqlite-blind-indexing",
+    )
+    return hkdf.derive(raw_key)
+
+
+def derive_integrity_key(raw_key: bytes) -> bytes:
+    """Derive a secure 32-byte record integrity signing key from master key using HKDF domain separation."""
+    try:
+        decoded = base64.urlsafe_b64decode(raw_key)
+        if len(decoded) == 32:
+            raw_key = decoded
+    except Exception:
+        pass
+    if len(raw_key) != 32:
+        raw_key = hashlib.sha256(raw_key).digest()
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"sqlite-integrity-salt-v1",
+        info=b"sqlite-integrity-hmac",
+    )
+    return hkdf.derive(raw_key)
+
+
 def _get_indexing_key() -> bytes:
     """Derive a secure 32-byte indexing key from the master encryption key."""
-    raw_key = os.getenv("ENCRYPTION_KEY")
-    if not raw_key:
-        key_file = ROOT_DIR / "secret.key"
-        if key_file.exists():
-            raw_key = key_file.read_text().strip()
-        else:
-            _get_ciphers()
-            raw_key = key_file.read_text().strip()
+    return derive_indexing_key(_get_raw_key_material())
 
-    if isinstance(raw_key, str):
-        raw_key = raw_key.encode("utf-8")
 
-    return hmac.new(raw_key, b"blind-indexing-salt", hashlib.sha256).digest()
+def _get_integrity_key() -> bytes:
+    """Derive a secure 32-byte integrity key from the master encryption key."""
+    return derive_integrity_key(_get_raw_key_material())
 
 
 def compute_blind_index(value: Any) -> str:
@@ -250,11 +377,15 @@ def pack_and_encrypt(data: Any, cipher: Any = None) -> bytes:
             nonce = os.urandom(12)
             ciphertext = cipher.encrypt(nonce, payload, associated_data=None)
             res = _PREFIX_GCM + nonce + ciphertext
+        elif isinstance(cipher, ChaCha20Poly1305):
+            nonce = os.urandom(12)
+            ciphertext = cipher.encrypt(nonce, payload, associated_data=None)
+            res = _PREFIX_CHACHA + nonce + ciphertext
         elif isinstance(cipher, Fernet):
             ciphertext = cipher.encrypt(payload)
             res = _PREFIX_FERNET + ciphertext
         else:
-            raise TypeError("Cipher must be an instance of AESGCM or Fernet.")
+            raise TypeError("Cipher must be an instance of AESGCM, ChaCha20Poly1305, or Fernet.")
     else:
         # Otherwise, encrypt using the active algorithm
         aesgcm_cipher, fernet_cipher = _get_ciphers()
@@ -263,6 +394,11 @@ def pack_and_encrypt(data: Any, cipher: Any = None) -> bytes:
         if algo == "AES-128-FERNET":
             ciphertext = fernet_cipher.encrypt(payload)
             res = _PREFIX_FERNET + ciphertext
+        elif algo in ("CHACHA20-POLY1305", "CHACHA20", "XCHACHA20-POLY1305"):
+            chacha = _get_chacha_cipher()
+            nonce = os.urandom(12)
+            ciphertext = chacha.encrypt(nonce, payload, associated_data=None)
+            res = _PREFIX_CHACHA + nonce + ciphertext
         else:
             # Default to AES-256-GCM
             nonce = os.urandom(12)
@@ -289,7 +425,11 @@ def decrypt_and_unpack(encrypted_blob: bytes, cipher: Any = None) -> Any:
     # Handle explicit custom cipher instance
     if cipher is not None:
         actual_blob = encrypted_blob
-        if encrypted_blob.startswith(_PREFIX_GCM) or encrypted_blob.startswith(_PREFIX_FERNET):
+        if (
+            encrypted_blob.startswith(_PREFIX_GCM)
+            or encrypted_blob.startswith(_PREFIX_FERNET)
+            or encrypted_blob.startswith(_PREFIX_CHACHA)
+        ):
             actual_blob = encrypted_blob[5:]
 
         if isinstance(cipher, AESGCM):
@@ -298,10 +438,16 @@ def decrypt_and_unpack(encrypted_blob: bytes, cipher: Any = None) -> Any:
             nonce = actual_blob[:12]
             ciphertext = actual_blob[12:]
             decrypted = cipher.decrypt(nonce, ciphertext, associated_data=None)
+        elif isinstance(cipher, ChaCha20Poly1305):
+            if len(actual_blob) < 12:
+                raise ValueError("Payload missing ChaCha20 nonce.")
+            nonce = actual_blob[:12]
+            ciphertext = actual_blob[12:]
+            decrypted = cipher.decrypt(nonce, ciphertext, associated_data=None)
         elif isinstance(cipher, Fernet):
             decrypted = cipher.decrypt(actual_blob)
         else:
-            raise TypeError("Cipher must be an instance of AESGCM or Fernet.")
+            raise TypeError("Cipher must be an instance of AESGCM, ChaCha20Poly1305, or Fernet.")
     else:
         # Auto-detect using prefixes
         aesgcm_cipher, fernet_cipher = _get_ciphers()
@@ -313,6 +459,14 @@ def decrypt_and_unpack(encrypted_blob: bytes, cipher: Any = None) -> Any:
             nonce = actual_blob[:12]
             ciphertext = actual_blob[12:]
             decrypted = aesgcm_cipher.decrypt(nonce, ciphertext, associated_data=None)
+        elif encrypted_blob.startswith(_PREFIX_CHACHA):
+            actual_blob = encrypted_blob[5:]
+            if len(actual_blob) < 12:
+                raise ValueError("Payload missing ChaCha20 nonce.")
+            nonce = actual_blob[:12]
+            ciphertext = actual_blob[12:]
+            chacha = _get_chacha_cipher()
+            decrypted = chacha.decrypt(nonce, ciphertext, associated_data=None)
         elif encrypted_blob.startswith(_PREFIX_FERNET):
             actual_blob = encrypted_blob[5:]
             decrypted = fernet_cipher.decrypt(actual_blob)
@@ -401,6 +555,17 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 
+def rebuild_bloom_filter():
+    """Rebuild the in-memory Bloom filter from active non-expired keys in SQLite."""
+    conn = get_db_connection()
+    now_ts = int(time.time())
+    cursor = conn.cursor()
+    cursor.execute("SELECT key FROM kv_store WHERE expires_at == 0 OR expires_at > ?", (now_ts,))
+    keys = [r["key"] for r in cursor.fetchall()]
+    bloom.clear()
+    bloom.populate_from_keys(keys)
+
+
 def init_db():
     """Idempotently initialize database tables, indexes, and populate bloom filter."""
     global _db_initialized
@@ -439,6 +604,9 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_kv_expires ON kv_store (expires_at);
             """)
             conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_kv_expires_updated ON kv_store (expires_at, updated_at DESC);
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS blind_indexes (
                     key TEXT NOT NULL,
                     field_name TEXT NOT NULL,
@@ -450,12 +618,9 @@ def init_db():
                 CREATE INDEX IF NOT EXISTS idx_blind_hash ON blind_indexes (field_name, field_hash);
             """)
 
-        # Populate in-memory bloom filter from existing keys
+        # Populate in-memory bloom filter from existing non-expired keys
         try:
-            cur = conn.cursor()
-            cur.execute("SELECT key FROM kv_store")
-            for r in cur.fetchall():
-                bloom.add(r["key"])
+            rebuild_bloom_filter()
         except Exception:
             pass
 
@@ -659,14 +824,31 @@ def kv_set_versioned(key: str, data: Any, expected_version: int, ttl: int | floa
 
 
 def kv_delete(key: str) -> bool:
-    """Delete a document by key from kv_store and clear its blind indexes."""
+    """Delete a document by key from kv_store, clear its blind indexes, and remove disk backup if present."""
     init_db()
     conn = get_db_connection()
     with conn:
         conn.execute("DELETE FROM blind_indexes WHERE key = ?", (key,))
         cur = conn.execute("DELETE FROM kv_store WHERE key = ?", (key,))
         deleted = cur.rowcount > 0
+
+        # Prevent zombie resurrects in load_json by cleaning up fallback disk file
+        try:
+            target = DATA_DIR / key
+            if target.exists():
+                target.unlink()
+            tmp_target = DATA_DIR / f"{key}.tmp"
+            if tmp_target.exists():
+                tmp_target.unlink()
+        except Exception:
+            pass
+
         if deleted:
+            try:
+                from .cache import cache
+                cache._adapter.delete(key)
+            except Exception:
+                pass
             try:
                 from .metrics import metrics
                 metrics.record_operation("delete")
@@ -902,6 +1084,11 @@ def purge_expired_records() -> int:
         except Exception:
             pass
 
+        try:
+            rebuild_bloom_filter()
+        except Exception:
+            pass
+
         return cur.rowcount
 
 
@@ -968,9 +1155,11 @@ def rotate_encryption_key(old_key: str | bytes, new_key: str | bytes) -> dict:
 
     # Initialize ciphers for both old and new keys
     old_aesgcm = AESGCM(old_key_raw)
+    old_chacha = ChaCha20Poly1305(old_key_raw)
     old_fernet = Fernet(base64.urlsafe_b64encode(old_key_raw) if len(old_key_raw) == 32 else old_key)
     
     new_aesgcm = AESGCM(new_key_raw)
+    new_chacha = ChaCha20Poly1305(new_key_raw)
     new_fernet = Fernet(base64.urlsafe_b64encode(new_key_raw) if len(new_key_raw) == 32 else new_key)
 
     conn = get_db_connection()
@@ -989,19 +1178,26 @@ def rotate_encryption_key(old_key: str | bytes, new_key: str | bytes) -> dict:
             # Decrypt: auto-detect prefix/type and decrypt with the correct cipher
             if old_blob.startswith(_PREFIX_GCM):
                 data = decrypt_and_unpack(old_blob, cipher=old_aesgcm)
+            elif old_blob.startswith(_PREFIX_CHACHA):
+                data = decrypt_and_unpack(old_blob, cipher=old_chacha)
             elif old_blob.startswith(_PREFIX_FERNET) or old_blob.startswith(b"gAAAA") or (len(old_blob) > 0 and old_blob[0] == 0x80):
                 data = decrypt_and_unpack(old_blob, cipher=old_fernet)
             else:
-                # Try GCM, then Fernet
+                # Try GCM, ChaCha, then Fernet
                 try:
                     data = decrypt_and_unpack(old_blob, cipher=old_aesgcm)
                 except Exception:
-                    data = decrypt_and_unpack(old_blob, cipher=old_fernet)
+                    try:
+                        data = decrypt_and_unpack(old_blob, cipher=old_chacha)
+                    except Exception:
+                        data = decrypt_and_unpack(old_blob, cipher=old_fernet)
 
             # Encrypt with new key using active algorithm
             algo = get_active_algorithm()
             if algo == "AES-128-FERNET":
                 new_blob = pack_and_encrypt(data, cipher=new_fernet)
+            elif algo in ("CHACHA20-POLY1305", "CHACHA20", "XCHACHA20-POLY1305"):
+                new_blob = pack_and_encrypt(data, cipher=new_chacha)
             else:
                 new_blob = pack_and_encrypt(data, cipher=new_aesgcm)
 
@@ -1009,14 +1205,20 @@ def rotate_encryption_key(old_key: str | bytes, new_key: str | bytes) -> dict:
         except Exception:
             continue
 
-    # Derive new index key for rotation
-    new_idx_key = hmac.new(new_key, b"blind-indexing-salt", hashlib.sha256).digest()
+    # Derive new index key for rotation using HKDF
+    new_idx_key = derive_indexing_key(new_key_raw)
 
     # Atomic write of all rotated records
     with conn:
         for key, new_blob, ver, exp, ts, data in re_encrypted_records:
             conn.execute("UPDATE kv_store SET value = ?, version = ?, expires_at = ?, updated_at = ? WHERE key = ?", (new_blob, ver, exp, ts, key))
             _update_blind_indexes(conn, key, data, custom_derived_key=new_idx_key)
+            bloom.add(key)
+
+    try:
+        rebuild_bloom_filter()
+    except Exception:
+        pass
 
     # Update active in-memory cipher keys
     set_cipher_key(new_key)
@@ -1035,7 +1237,7 @@ def rotate_encryption_key(old_key: str | bytes, new_key: str | bytes) -> dict:
 
 
 def db_maintenance() -> dict:
-    """Run database optimization, WAL checkpoint truncation and maintenance."""
+    """Run database optimization, WAL checkpoint truncation, bloom rebuild, and maintenance."""
     init_db()
     conn = get_db_connection()
     stats = {"status": "ok"}
@@ -1043,6 +1245,10 @@ def db_maintenance() -> dict:
         with conn:
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             conn.execute("PRAGMA optimize;")
+        try:
+            rebuild_bloom_filter()
+        except Exception:
+            pass
         if DB_PATH.exists():
             size = DB_PATH.stat().st_size
             stats["size_kb"] = round(size / 1024, 2)

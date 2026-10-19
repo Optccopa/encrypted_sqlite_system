@@ -8,7 +8,11 @@
 [![Database](https://img.shields.io/badge/storage-SQLite%20WAL-orange.svg)](https://sqlite.org/)
 [![License](https://img.shields.io/badge/license-MIT-purple.svg)](LICENSE)
 
-A high-performance, thread-safe, **AES-256-GCM encrypted SQLite document store and Two-Tier caching engine** for Python & Node.js applications, bots, and microservices. Run instantly with **Python** or zero-install via **`npx encrypted-sqlite`**!
+A high-performance, thread-safe, **AES-256-GCM / ChaCha20-Poly1305 encrypted SQLite document store and Two-Tier caching engine** for Python & Node.js applications, bots, and microservices. Run instantly with **Python** or zero-install via **`npx encrypted-sqlite`**!
+
+<p align="center">
+  <img src="assets/architecture_v2.png" alt="Encrypted SQLite System v2.0 Architecture" width="100%" />
+</p>
 
 Serves as a transparent, high-speed drop-in replacement for standard flat `.json` file storage with sub-millisecond memory caching and zero-lock concurrency.
 
@@ -16,9 +20,9 @@ Serves as a transparent, high-speed drop-in replacement for standard flat `.json
 
 ## 🌟 Key Features
 
-* 🔒 **AES-256-GCM Authenticated Encryption at Rest**: All JSON documents and database tables are encrypted with Galois/Counter Mode (AEAD) before touching physical storage.
-* ⚡ **Two-Tier (L1/L2) Caching**:
-* ☁️ **Encrypted Cloud Disaster Recovery Sync**: Non-blocking live online database backups streamed to **Cloudflare R2**, **AWS S3**, **Backblaze B2**, or **MinIO** with automated retention pruning.
+* 🔒 **AES-256-GCM & ChaCha20-Poly1305 Authenticated Encryption**: AEAD encryption at rest with PBKDF2-HMAC-SHA256 passphrase derivation (600,000 rounds) and HKDF domain separation.
+* ⚡ **Two-Tier (L1/L2) Caching**: Sub-millisecond lookups with LRU RAM, in-memory Zstandard compression, and Redis support.
+* ☁️ **Zero-Knowledge Cloud Disaster Recovery**: Non-blocking live database backups with whole-file AES-GCM envelope encryption streamed to **Cloudflare R2**, **AWS S3**, **Backblaze B2**, or **MinIO**.
 * 🔍 **Fast Document Query & Wildcard Search**: Query encrypted documents with wildcard glob patterns (`kv_search`) or custom Python predicate filters (`kv_find`) with parallel multi-core decryption.
 * 🌊 **Asynchronous Write-Behind Batch Journaling**: Coalesces high-frequency writes in memory and flushes them to SQLite in bulk transactions (over **300,000 writes/sec**).
 * 🏎️ **Multi-Key Batch Operations & Parallel Decryption (`kv_mget` / `kv_mset`)**: Loads and saves multiple keys in a single SQL roundtrip with parallel multi-core CPU thread pool decryption.
